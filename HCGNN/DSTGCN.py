@@ -8,6 +8,7 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from torch_geometric.nn import ChebConv
 import matplotlib.pyplot as plt
+
 plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 
@@ -51,7 +52,6 @@ class FloodDataset(Dataset):
                 fus = np.concatenate([dyn, sta], -1).reshape(T, 6400, 5)
                 lab = dyn[..., 1:2].reshape(T, 6400, 1)
 
-                # ✅ 归一化（修复训练爆炸）
                 fus = (fus - fus.min()) / (fus.max() - fus.min() + 1e-8)
                 lab = (lab - lab.min()) / (lab.max() - lab.min() + 1e-8)
 
@@ -66,30 +66,41 @@ class FloodDataset(Dataset):
         x, y = self.samples[idx]
         return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
 
-# ====================== DSTGCN 网络 ======================
+# ====================== 【升级】DSTGCN 稳定网络 ======================
 class TemporalConv(nn.Module):
     def __init__(self, cin, cout):
         super().__init__()
         self.conv = nn.Conv2d(cin, cout, kernel_size=(3,1), padding=(1,0))
         self.relu = nn.ReLU()
+        self.norm = nn.LayerNorm(cout)
+        self.drop = nn.Dropout(0.15)
+
     def forward(self, x):
         x = x.permute(0,3,1,2)
         x = self.relu(self.conv(x))
-        return x.permute(0,2,3,1)
+        x = x.permute(0,2,3,1)
+        x = self.norm(x)
+        return self.drop(x)
 
 class SpatialConv(nn.Module):
     def __init__(self, cin, cout):
         super().__init__()
         self.conv = ChebConv(cin, cout, K=3)
         self.relu = nn.ReLU()
+        self.norm = nn.LayerNorm(cout)
+        self.drop = nn.Dropout(0.15)
+
     def forward(self, x, edge_index, edge_weight):
-        return self.relu(self.conv(x, edge_index, edge_weight))
+        x = self.relu(self.conv(x, edge_index, edge_weight))
+        x = self.norm(x)
+        return self.drop(x)
 
 class STBlock(nn.Module):
     def __init__(self, cin, cout):
         super().__init__()
         self.tconv = TemporalConv(cin, cout)
         self.sconv = SpatialConv(cout, cout)
+
     def forward(self, x, edge_index, edge_weight):
         x = self.tconv(x)
         B, T, N, C = x.shape
@@ -104,27 +115,62 @@ class DSTGCN(nn.Module):
         self.st1 = STBlock(5, 64)
         self.st2 = STBlock(64, 64)
         self.out = nn.Linear(64, 1)
+
     def forward(self, x, edge_index, edge_weight):
         x = self.st1(x, edge_index, edge_weight)
         x = self.st2(x, edge_index, edge_weight)
         return self.out(x)[:, :CONFIG["output_window"]]
 
-# ====================== 水文指标（已修复） ======================
+# ====================== 指标 ======================
 def calc_metrics(y_true, y_pred):
     yt = y_true.flatten().cpu().numpy()
     yp = y_pred.flatten().cpu().numpy()
-
     mae = np.mean(np.abs(yt - yp))
     rmse = np.sqrt(np.mean((yt - yp) ** 2))
-
-    # ✅ 修复 NSE / R² 公式
     mean_yt = np.mean(yt)
     nse = 1 - (np.sum((yt - yp) ** 2) / (np.sum((yt - mean_yt) ** 2) + 1e-8))
     r2 = 1 - (np.sum((yt - yp) ** 2) / (np.sum((yt - mean_yt) ** 2) + 1e-8))
-
     return mae, rmse, nse, r2
 
-# ====================== 可视化 ======================
+# ====================== 【升级】画图 + 保存 ======================
+def plot_and_save_metrics(train_loss, train_rmse, val_rmse, train_nse, val_nse):
+    epochs = list(range(1, len(train_loss)+1))
+    plt.figure(figsize=(16,10))
+
+    # Loss
+    plt.subplot(2,2,1)
+    plt.plot(epochs, train_loss, 'b-o', label='训练Loss')
+    plt.title('Loss 变化曲线')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+
+    # RMSE
+    plt.subplot(2,2,2)
+    plt.plot(epochs, train_rmse, 'r-o', label='训练RMSE')
+    plt.plot(epochs, val_rmse, 'g-o', label='验证RMSE')
+    plt.title('RMSE 变化曲线')
+    plt.xlabel('Epoch')
+    plt.ylabel('RMSE')
+    plt.legend()
+    plt.grid(True)
+
+    # NSE
+    plt.subplot(2,2,3)
+    plt.plot(epochs, train_nse, 'orange', marker='o', label='训练NSE')
+    plt.plot(epochs, val_nse, 'purple', marker='o', label='验证NSE')
+    plt.axhline(0, c='gray', ls='--')
+    plt.title('NSE 变化曲线')
+    plt.xlabel('Epoch')
+    plt.ylabel('NSE')
+    plt.legend()
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.savefig("训练指标曲线.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
 def plot_result(y, pred):
     y = y[0,0].reshape(80,80).cpu().numpy()
     p = pred[0,0].reshape(80,80).cpu().numpy()
@@ -132,11 +178,12 @@ def plot_result(y, pred):
     plt.subplot(121); plt.imshow(y, cmap="Blues"); plt.title("真实水深"); plt.axis("off")
     plt.subplot(122); plt.imshow(p, cmap="Blues"); plt.title("预测水深"); plt.axis("off")
     plt.tight_layout()
+    plt.savefig("水深预测图.png", dpi=300, bbox_inches='tight')
     plt.show()
 
-# ====================== 训练 ======================
+# ====================== 【升级】训练流程（先训练 → 后验证） ======================
 def run():
-    print("\n🚀 启动 DSTGCN 训练（验证集正常生效版）\n")
+    print("\n🚀 启动 DSTGCN 训练（稳定增强版）\n")
     train_loader = DataLoader(FloodDataset("train"), CONFIG["batch_size"], shuffle=True)
     val_loader   = DataLoader(FloodDataset("val"),   CONFIG["batch_size"])
     test_loader  = DataLoader(FloodDataset("test"),  1)
@@ -147,12 +194,20 @@ def run():
     model = DSTGCN().to(CONFIG["device"])
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=CONFIG["lr"], weight_decay=CONFIG["weight_decay"])
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
     best_rmse = 1e9
 
+    # 记录指标
+    history = {
+        "train_loss": [], "train_rmse": [], "train_nse": [],
+        "val_rmse": [], "val_nse": []
+    }
+
     for epoch in range(CONFIG["epochs"]):
+        # ============== 1. 训练 ==============
         model.train()
         total_loss = 0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{CONFIG['epochs']}")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{CONFIG['epochs']} 训练中")
         for x, y in pbar:
             x, y = x.to(CONFIG["device"]), y.to(CONFIG["device"])
             pred = model(x, ei, ew)
@@ -162,10 +217,9 @@ def run():
             optimizer.step()
             total_loss += loss.item() * x.size(0)
             pbar.set_postfix(loss=f"{loss.item():.4f}")
-
         train_loss = total_loss / len(train_loader.dataset)
 
-        # ====================== 计算 训练集 指标 ======================
+        # ============== 2. 训练集评估 ==============
         model.eval()
         tr_mae=tr_rmse=tr_nse=tr_r2=0
         with torch.no_grad():
@@ -176,13 +230,15 @@ def run():
                 tr_mae += mae*x.size(0)
                 tr_rmse += rmse*x.size(0)
                 tr_nse += nse*x.size(0)
-                tr_r2 += r2*x.size(0)
         tr_mae /= len(train_loader.dataset)
         tr_rmse /= len(train_loader.dataset)
         tr_nse /= len(train_loader.dataset)
-        tr_r2 /= len(train_loader.dataset)
 
-        # ====================== 计算 验证集 指标 ======================
+        print(f"\n📊 Epoch {epoch+1} 训练集结果：")
+        print(f"    Loss {train_loss:.4f} | MAE {tr_mae:.4f} | RMSE {tr_rmse:.4f} | NSE {tr_nse:.4f}")
+
+        # ============== 3. 验证集评估（你要的顺序） ==============
+        print(f"🔍 开始验证集评估...")
         val_mae=val_rmse=val_nse=val_r2=0
         with torch.no_grad():
             for x,y in val_loader:
@@ -192,24 +248,39 @@ def run():
                 val_mae += mae*x.size(0)
                 val_rmse += rmse*x.size(0)
                 val_nse += nse*x.size(0)
-                val_r2 += r2*x.size(0)
         val_mae /= len(val_loader.dataset)
         val_rmse /= len(val_loader.dataset)
         val_nse /= len(val_loader.dataset)
-        val_r2 /= len(val_loader.dataset)
 
-        # ====================== 同时打印 训练集 & 验证集 ======================
-        print(f"📊 Epoch {epoch+1}")
-        print(f"    训练集 | Loss {train_loss:.4f} | MAE {tr_mae:.4f} | RMSE {tr_rmse:.4f} | NSE {tr_nse:.4f} | R² {tr_r2:.4f}")
-        print(f"    验证集 | ----       | MAE {val_mae:.4f} | RMSE {val_rmse:.4f} | NSE {val_nse:.4f} | R² {val_r2:.4f}")
+        print(f"✅ 验证集结果：")
+        print(f"    MAE {val_mae:.4f} | RMSE {val_rmse:.4f} | NSE {val_nse:.4f}")
 
-        # 保存最优
+        # 保存历史
+        history["train_loss"].append(train_loss)
+        history["train_rmse"].append(tr_rmse)
+        history["train_nse"].append(tr_nse)
+        history["val_rmse"].append(val_rmse)
+        history["val_nse"].append(val_nse)
+
+        # 保存最优模型
         if val_rmse < best_rmse:
             best_rmse = val_rmse
             torch.save(model.state_dict(), "best_dstgcn.pth")
-            print("💾 验证集最优 → 已保存模型")
+            print("💾 验证集最优 → 模型已保存！")
 
-    # 测试
+        scheduler.step(val_rmse)
+
+    # ============== 训练结束 → 画图 ==============
+    print("\n📈 绘制训练指标曲线并保存...")
+    plot_and_save_metrics(
+        history["train_loss"],
+        history["train_rmse"],
+        history["val_rmse"],
+        history["train_nse"],
+        history["val_nse"]
+    )
+
+    # ============== 测试 ==============
     model.load_state_dict(torch.load("best_dstgcn.pth"))
     model.eval()
     print("\n🎉 测试集结果：")
@@ -223,7 +294,6 @@ def run():
             break
 
 if __name__ == "__main__":
-    # ====================== 命令行参数 ======================
     def parse_args():
         parser = argparse.ArgumentParser(description="DSTGCN 水文时空预测模型")
         parser.add_argument('--time_steps', type=int, default=24, help='历史输入时间步')
@@ -235,8 +305,6 @@ if __name__ == "__main__":
         return parser.parse_args()
 
     args = parse_args()
-
-    # ====================== 配置 ======================
     CONFIG = {
         "input_window": args.time_steps,
         "output_window": args.output_steps,
@@ -250,6 +318,5 @@ if __name__ == "__main__":
         "weight_decay": args.weight_decay,
         "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     }
-
     print("\n✅ 加载参数: ", CONFIG)
     run()
