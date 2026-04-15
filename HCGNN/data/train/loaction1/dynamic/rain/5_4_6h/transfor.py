@@ -33,7 +33,7 @@ def load_wd_depth(wd_folder, grid_size=80):
     """
     自动识别所有.wd文件，返回总时间步数 + 深度数据
     返回:
-        depth_data: shape (grid_size, grid_size, N)
+        depth_data: shape (T, H, W)
         total_time_steps: 总时间步数（自动识别）
     """
     # 读取并排序所有wd文件（自动识别数量）
@@ -41,7 +41,8 @@ def load_wd_depth(wd_folder, grid_size=80):
     total_time_steps = len(wd_files)
     print(f"✅ 自动识别 .wd 文件总数 = {total_time_steps}")
 
-    depth_data = np.zeros((grid_size, grid_size, total_time_steps), dtype=np.float32)
+    # 修改：shape = (T, H, W)
+    depth_data = np.zeros((total_time_steps, grid_size, grid_size), dtype=np.float32)
 
     for t, wd_file in enumerate(wd_files):
         wd_path = os.path.join(wd_folder, wd_file)
@@ -52,7 +53,8 @@ def load_wd_depth(wd_folder, grid_size=80):
         data_lines = lines[6: 6 + grid_size]
         for row_idx, line in enumerate(data_lines):
             parts = list(map(float, line.strip().split()))
-            depth_data[row_idx, :, t] = parts[:grid_size]
+            # 修改维度顺序
+            depth_data[t, row_idx, :] = parts[:grid_size]
 
     return depth_data, total_time_steps
 
@@ -62,25 +64,26 @@ def main():
     base_dir = r"E:\Coding\Pytorch\PyGTemporalZHC\HCGNN\data\train\loaction1\dynamic\rain\5_4_6h"
     rain_file_name = "5_4_6h.rain"
     wd_folder_name = "result"
-    output_npy_name = "80x80x2_feature.npy"
+    output_npy_name = "THWC_feature.npy"
     grid_size = 80
     # =========================================================================
 
     # 1. 加载积水深度 + 自动获取总时间步
     wd_folder_path = os.path.join(base_dir, wd_folder_name)
-    depth_data, N = load_wd_depth(wd_folder_path, grid_size)
+    depth_data, N = load_wd_depth(wd_folder_path, grid_size)  # (T, H, W)
 
     # 2. 加载并对齐降雨序列
     rain_file_path = os.path.join(base_dir, rain_file_name)
     rain_intensity = load_rain_sequence(rain_file_path, N)
     print(f"✅ 降雨序列已对齐到总时间步 N = {N}")
 
-    # 3. 广播降雨到 80x80
-    rain_feature = np.broadcast_to(rain_intensity, (grid_size, grid_size, N))
+    # 3. 构造降雨特征 (T, H, W)
+    rain_feature = np.expand_dims(rain_intensity, axis=(1, 2))  # (T,1,1)
+    rain_feature = np.tile(rain_feature, (1, grid_size, grid_size))  # (T,H,W)
 
-    # 4. 拼接特征：80x80x2xN
-    combined = np.stack([rain_feature, depth_data], axis=2)
-    print(f"✅ 最终数据 shape = {combined.shape} (80x80x2xN)")
+    # 4. 拼接成 T,H,W,C
+    combined = np.stack([rain_feature, depth_data], axis=-1)
+    print(f"✅ 最终数据 shape = {combined.shape} (T, H, W, C)")
 
     # 5. 保存
     output_path = os.path.join(base_dir, output_npy_name)

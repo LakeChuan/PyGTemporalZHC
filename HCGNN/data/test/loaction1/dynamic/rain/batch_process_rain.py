@@ -105,7 +105,7 @@ def process_single_rain_folder(folder_path, grid_size=80):
 
 def main():
     # ====================== 根目录配置（直接用你当前的路径） ======================
-    root_rain_dir = r"E:\Coding\Pytorch\PyGTemporalZHC\HCGNN\data\train\loaction1\dynamic\rain"
+    root_rain_dir = r"E:\Coding\Pytorch\PyGTemporalZHC\HCGNN\data\test\loaction1\dynamic\rain"
     grid_size = 80
     # =========================================================================
 

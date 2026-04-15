@@ -83,7 +83,7 @@ def compare_npy_files(file1: str, file2: str, output_txt: str = "diff_result.txt
 if __name__ == "__main__":
     # 替换为你的两个npy文件路径
     file_path1 = "5_4_6h_feature.npy"
-    file_path2 = "80x80x2_feature.npy"
+    file_path2 = "THWC_feature.npy"
     # 结果保存的txt路径
     output_path = "npy_diff_result.txt"
 
