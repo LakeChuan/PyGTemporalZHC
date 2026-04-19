@@ -1,293 +1,280 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import pickle
 import os
-import time
+import scipy.sparse as sp
 import matplotlib.pyplot as plt
-from sklearn.preprocessing import StandardScaler
-import warnings
+from tqdm import tqdm
+from datetime import datetime
 
-warnings.filterwarnings('ignore')
-
-# ===================== 全局配置（与论文和你的数据对齐） =====================
+# ======================== 超参数（稳定版）=========================
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-SEQ_LEN = 12  # 输入序列长度：5min×12=1小时
-PRED_LEN = 12  # 预测长度：5min×12=1小时
-BATCH_SIZE = 64
-EPOCHS = 10
-LR = 0.01
-HID_CHANNELS = 64
-K = 3  # 扩散步数（论文默认）
-NUM_LAYERS = 2  # DCGRU层数
-NUM_NODES = 207  # METR-LA传感器数量
+SEQ_LEN = 12
+PRED_LEN = 12
+NUM_NODES = 207
+INPUT_DIM = 1
+OUTPUT_DIM = 1
+RNN_UNITS = 64        # 恢复
+NUM_LAYERS = 2        # 恢复
+MAX_DIFFUSION_STEP = 2
+BATCH_SIZE = 32
+EPOCHS = 30
+LR = 0.001             # 变小，训练更稳定
+USE_CURRICULUM = False # 关闭课程学习，防止震荡
+CL_DECAY_STEPS = 1000
+
+# ======================== 路径 =========================
 DATA_ROOT = "./METR-LA"
 ADJ_PATH = "./sensor_graph/adj_mx.pkl"
 
+# ======================== 时间戳目录 =========================
+run_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+SAVE_DIR = f"./results/DCRNN_METR-LA_{run_time}"
+os.makedirs(SAVE_DIR, exist_ok=True)
+LOG_FILE = os.path.join(SAVE_DIR, "log.txt")
 
-# ===================== 数据集：直接读取你现有的 npz 文件 =====================
-class METRLADataset(Dataset):
-    def __init__(self, npz_path, scaler=None):
-        data = np.load(npz_path)
-        self.x = data['x']  # (num_samples, seq_len, num_nodes, 2)
-        self.y = data['y']  # (num_samples, pred_len, num_nodes, 2)
+def log_print(msg):
+    print(msg)
+    with open(LOG_FILE, 'a', encoding='utf-8') as f:
+        f.write(msg + '\n')
 
-        # 只取速度特征（第0维）
-        self.x = self.x[..., 0:1]  # (N, T, N_nodes, 1)
-        self.y = self.y[..., 0:1]
+# ===========================================================================
+# ======================== 工具函数 ========================
+# ===========================================================================
+class StandardScaler:
+    def __init__(self, mean, std):
+        self.mean = mean
+        self.std = std
+    def transform(self, data):
+        return (data - self.mean) / self.std
+    def inverse_transform(self, data):
+        return data * self.std + self.mean
 
-        # 标准化（用训练集的scaler）
-        if scaler is not None:
-            N, T, N_nodes, C = self.x.shape
-            self.x = scaler.transform(self.x.reshape(-1, C)).reshape(N, T, N_nodes, C)
-            N, T, N_nodes, C = self.y.shape
-            self.y = scaler.transform(self.y.reshape(-1, C)).reshape(N, T, N_nodes, C)
+def load_graph_data(pkl_filename):
+    with open(pkl_filename, 'rb') as f:
+        sensor_ids, sensor_id_to_ind, adj_mx = pickle.load(f, encoding='latin1')
+    return adj_mx.astype(np.float32)
 
-    def __len__(self):
-        return len(self.x)
+def calculate_random_walk_matrix(adj_mx):
+    adj = sp.coo_matrix(adj_mx)
+    d = np.array(adj.sum(1))
+    d_inv = np.power(d, -1).flatten()
+    d_inv[np.isinf(d_inv)] = 0.0
+    d_mat_inv = sp.diags(d_inv)
+    rw = d_mat_inv.dot(adj).tocoo()
+    return torch.FloatTensor(rw.toarray()).to(DEVICE)
 
-    def __getitem__(self, idx):
-        return torch.FloatTensor(self.x[idx]), torch.FloatTensor(self.y[idx])
+def load_dataset(root):
+    data = {}
+    for split in ['train', 'val', 'test']:
+        path = os.path.join(root, f'{split}.npz')
+        npz = np.load(path)
+        data[f'x_{split}'] = npz['x'][..., [0]]
+        data[f'y_{split}'] = npz['y'][..., [0]]
+    scaler = StandardScaler(data['x_train'][...,0].mean(), data['x_train'][...,0].std())
+    for split in ['train', 'val', 'test']:
+        data[f'x_{split}'] = scaler.transform(data[f'x_{split}'])
+        data[f'y_{split}'] = scaler.transform(data[f'y_{split}'])
+    return data, scaler
 
-
-# ===================== 加载邻接矩阵（用你现有的 adj_mx.pkl） =====================
-def load_adj(pkl_path):
-    with open(pkl_path, 'rb') as f:
-        _, _, adj_mx = pickle.load(f, encoding='latin1')
-    adj_mx = adj_mx.astype(np.float32)
-    return torch.FloatTensor(adj_mx).to(DEVICE)
-
-
-# ===================== 扩散卷积 =====================
+# ===========================================================================
+# ======================== 扩散卷积 ========================
+# ===========================================================================
 class DiffusionConv(nn.Module):
-    def __init__(self, in_channels, out_channels, K=3):
+    def __init__(self, in_dim, out_dim, K):
         super().__init__()
         self.K = K
-        self.theta1 = nn.Parameter(torch.randn(K, in_channels, out_channels))
-        self.theta2 = nn.Parameter(torch.randn(K, in_channels, out_channels))
-        self.bias = nn.Parameter(torch.zeros(out_channels))
-        nn.init.xavier_uniform_(self.theta1)
-        nn.init.xavier_uniform_(self.theta2)
+        self.W = nn.Linear(in_dim * (2 * K + 1), out_dim)
+    def forward(self, x, supports):
+        x_list = [x]
+        for adj in supports:
+            xp = x
+            for _ in range(self.K):
+                xp = torch.matmul(adj, xp)
+                x_list.append(xp)
+        return self.W(torch.cat(x_list, dim=-1))
 
-    def forward(self, x, adj):
-        # 计算转移矩阵
-        out_deg = torch.sum(adj, dim=1, keepdim=True)
-        out_deg[out_deg == 0] = 1.0
-        trans = adj / out_deg
-
-        in_deg = torch.sum(adj, dim=0, keepdim=True).t()
-        in_deg[in_deg == 0] = 1.0
-        trans_inv = adj.t() / in_deg
-
-        out = 0
-        # 前向扩散
-        x_prev = x
-        for k in range(self.K):
-            out += torch.matmul(x_prev, self.theta1[k])
-            x_prev = torch.matmul(trans, x_prev)
-
-        # 反向扩散
-        x_prev = x
-        for k in range(self.K):
-            out += torch.matmul(x_prev, self.theta2[k])
-            x_prev = torch.matmul(trans_inv, x_prev)
-
-        return out + self.bias
-
-
-# ===================== DCGRU单元 =====================
+# ===========================================================================
+# ======================== DCGRU Cell ========================
+# ===========================================================================
 class DCGRUCell(nn.Module):
-    def __init__(self, in_channels, hid_channels):
+    def __init__(self, in_dim, hidden_dim, supports, K):
         super().__init__()
-        self.gate_conv = DiffusionConv(in_channels + hid_channels, 2 * hid_channels, K)
-        self.cand_conv = DiffusionConv(in_channels + hid_channels, hid_channels, K)
+        self.hidden_dim = hidden_dim
+        self.gate_conv = DiffusionConv(in_dim + hidden_dim, hidden_dim * 2, K)
+        self.cand_conv = DiffusionConv(in_dim + hidden_dim, hidden_dim, K)
+        self.supports = supports
+    def forward(self, x, h):
+        comb = torch.cat([x, h], -1)
+        r, u = torch.chunk(torch.sigmoid(self.gate_conv(comb, self.supports)), 2, -1)
+        c = torch.tanh(self.cand_conv(torch.cat([x, r * h], -1), self.supports))
+        return u * h + (1 - u) * c
 
-    def forward(self, x, h_prev, adj):
-        combined = torch.cat([x, h_prev], dim=-1)
-        gate = torch.sigmoid(self.gate_conv(combined, adj))
-        r, u = torch.chunk(gate, 2, dim=-1)
-
-        combined_c = torch.cat([x, r * h_prev], dim=-1)
-        c = torch.tanh(self.cand_conv(combined_c, adj))
-
-        return u * h_prev + (1 - u) * c
-
-
-# ===================== Encoder =====================
-class DCRNNEncoder(nn.Module):
-    def __init__(self, in_channels, hid_channels):
+# ===========================================================================
+# ======================== Encoder / Decoder ========================
+# ===========================================================================
+class Encoder(nn.Module):
+    def __init__(self, in_dim, hidden_dim, num_layers, supports, K):
         super().__init__()
-        self.layers = nn.ModuleList([DCGRUCell(in_channels, hid_channels)])
-        for _ in range(NUM_LAYERS - 1):
-            self.layers.append(DCGRUCell(hid_channels, hid_channels))
-
-    def forward(self, x, adj):
-        B, T, N, C = x.shape
-        h = [torch.zeros(B, N, HID_CHANNELS).to(DEVICE) for _ in range(NUM_LAYERS)]
-
+        self.layers = nn.ModuleList([DCGRUCell(in_dim, hidden_dim, supports, K)])
+        for _ in range(num_layers-1):
+            self.layers.append(DCGRUCell(hidden_dim, hidden_dim, supports, K))
+    def forward(self, x_seq):
+        B, T, N, D = x_seq.shape
+        h = [torch.zeros(B, N, self.layers[0].hidden_dim).to(DEVICE) for _ in self.layers]
         for t in range(T):
-            x_t = x[:, t]
+            x = x_seq[:,t]
             for i, layer in enumerate(self.layers):
-                h[i] = layer(x_t, h[i], adj)
-                x_t = h[i]
+                h[i] = layer(x, h[i])
+                x = h[i]
         return h
 
-
-# ===================== Decoder =====================
-class DCRNNDecoder(nn.Module):
-    def __init__(self, hid_channels, out_channels):
+class Decoder(nn.Module):
+    def __init__(self, hidden_dim, out_dim, num_layers, supports, K):
         super().__init__()
-        self.layers = nn.ModuleList([DCGRUCell(out_channels, hid_channels)])
-        for _ in range(NUM_LAYERS - 1):
-            self.layers.append(DCGRUCell(hid_channels, hid_channels))
-        self.proj = DiffusionConv(hid_channels, out_channels, K)
-
-    def forward(self, h_enc, adj, pred_len):
+        self.layers = nn.ModuleList([DCGRUCell(out_dim, hidden_dim, supports, K)])
+        for _ in range(num_layers-1):
+            self.layers.append(DCGRUCell(hidden_dim, hidden_dim, supports, K))
+        self.proj = nn.Linear(hidden_dim, out_dim)
+        self.supports = supports
+    def forward(self, h_enc, y_gt, pred_len, use_cur, step):
         B, N, _ = h_enc[0].shape
-        outputs = []
-        x_t = torch.zeros(B, N, 1).to(DEVICE)
+        out, x = [], torch.zeros(B, N, OUTPUT_DIM).to(DEVICE)
         h = h_enc
-
-        for _ in range(pred_len):
+        for t in range(pred_len):
             for i, layer in enumerate(self.layers):
-                h[i] = layer(x_t, h[i], adj)
-                x_t = h[i]
-            x_t = self.proj(x_t, adj)
-            outputs.append(x_t.unsqueeze(1))
+                h[i] = layer(x, h[i])
+                x = h[i]
+            x = self.proj(x)
+            out.append(x.unsqueeze(1))
+            if use_cur and self.training and np.random.rand() < CL_DECAY_STEPS/(CL_DECAY_STEPS+np.exp(step/CL_DECAY_STEPS)):
+                x = y_gt[:,t]
+        return torch.cat(out, 1)
 
-        return torch.cat(outputs, dim=1)
-
-
-# ===================== DCRNN完整模型 =====================
 class DCRNN(nn.Module):
-    def __init__(self):
+    def __init__(self, supports):
         super().__init__()
-        self.encoder = DCRNNEncoder(1, HID_CHANNELS)
-        self.decoder = DCRNNDecoder(HID_CHANNELS, 1)
+        self.enc = Encoder(INPUT_DIM, RNN_UNITS, NUM_LAYERS, supports, MAX_DIFFUSION_STEP)
+        self.dec = Decoder(RNN_UNITS, OUTPUT_DIM, NUM_LAYERS, supports, MAX_DIFFUSION_STEP)
+    def forward(self, x, y, step=0):
+        return self.dec(self.enc(x), y, PRED_LEN, USE_CURRICULUM, step)
 
-    def forward(self, x, adj):
-        h_enc = self.encoder(x, adj)
-        return self.decoder(h_enc, adj, PRED_LEN)
+# ===========================================================================
+# ======================== 指标 ========================
+# ===========================================================================
+def masked_mae(pred, label, null=0):
+    m = (label != null).float()
+    m /= m.mean()
+    return (F.l1_loss(pred, label, reduction='none') * m).mean()
 
+def masked_rmse(pred, label, null=0):
+    m = (label != null).float()
+    m /= m.mean()
+    return torch.sqrt((F.mse_loss(pred, label, reduction='none') * m).mean())
 
-# ===================== 评估指标（和论文一致的 masked 版本） =====================
-def masked_mae(pred, label, mask_val=0.0):
-    mask = (label != mask_val).float()
-    mask /= mask.mean()
-    return (F.l1_loss(pred, label, reduction='none') * mask).mean()
+def masked_mape(pred, label, null=0):
+    m = (label != null).float()
+    m /= m.mean()
+    return (torch.abs((pred-label)/label) * m).mean()
 
-
-def masked_rmse(pred, label, mask_val=0.0):
-    mask = (label != mask_val).float()
-    mask /= mask.mean()
-    return torch.sqrt((F.mse_loss(pred, label, reduction='none') * mask).mean())
-
-
-def masked_mape(pred, label, mask_val=0.0):
-    mask = (label != mask_val).float()
-    mask /= mask.mean()
-    return (torch.abs((pred - label) / label) * mask).mean()
-
-
-# ===================== 训练/测试 =====================
-def train_epoch(model, loader, adj, optimizer):
-    model.train()
-    total_loss = 0
-    for x, y in loader:
-        x, y = x.to(DEVICE), y.to(DEVICE)
-        optimizer.zero_grad()
-        pred = model(x, adj)
-        loss = masked_mae(pred, y)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item() * x.size(0)
-    return total_loss / len(loader.dataset)
-
-
-def test_epoch(model, loader, adj):
+# ===========================================================================
+# ======================== 流畅训练核心 ========================
+# ===========================================================================
+def evaluate(model, x, y, batch_size):
     model.eval()
-    mae, rmse, mape = 0, 0, 0
+    total_mae = 0
+    total_rmse = 0
+    total_mape = 0
+    count = 0
     with torch.no_grad():
-        for x, y in loader:
-            x, y = x.to(DEVICE), y.to(DEVICE)
-            pred = model(x, adj)
-            mae += masked_mae(pred, y).item() * x.size(0)
-            rmse += masked_rmse(pred, y).item() * x.size(0)
-            mape += masked_mape(pred, y).item() * x.size(0)
-    cnt = len(loader.dataset)
-    return mae / cnt, rmse / cnt, mape / cnt
+        for i in range(0, len(x), batch_size):
+            x_b = x[i:i+batch_size]
+            y_b = y[i:i+batch_size]
+            pred = model(x_b, y_b)
+            total_mae += masked_mae(pred, y_b).item() * len(x_b)
+            total_rmse += masked_rmse(pred, y_b).item() * len(x_b)
+            total_mape += masked_mape(pred, y_b).item() * len(x_b)
+            count += len(x_b)
+    return total_mae/count, total_rmse/count, total_mape/count
 
+# ===========================================================================
+# ======================== 主程序 ========================
+# ===========================================================================
+if __name__ == "__main__":
+    adj = load_graph_data(ADJ_PATH)
+    supports = [calculate_random_walk_matrix(adj), calculate_random_walk_matrix(adj.T)]
+    data, scaler = load_dataset(DATA_ROOT)
 
-# ===================== 主函数（直接用你现有的数据文件） =====================
-def main():
-    # 1. 加载邻接矩阵
-    print("Loading adjacency matrix from sensor_graph/adj_mx.pkl...")
-    adj = load_adj(ADJ_PATH)
+    x_train = torch.FloatTensor(data['x_train']).to(DEVICE)
+    y_train = torch.FloatTensor(data['y_train']).to(DEVICE)
+    x_val = torch.FloatTensor(data['x_val']).to(DEVICE)
+    y_val = torch.FloatTensor(data['y_val']).to(DEVICE)
+    x_test = torch.FloatTensor(data['x_test']).to(DEVICE)
+    y_test = torch.FloatTensor(data['y_test']).to(DEVICE)
 
-    # 2. 加载训练数据，计算scaler
-    print("Loading datasets from METR-LA/*.npz...")
-    train_npz = np.load(os.path.join(DATA_ROOT, "train.npz"))
-    train_data_all = train_npz['x'][..., 0].reshape(-1, 1)
-    scaler = StandardScaler()
-    scaler.fit(train_data_all)
+    model = DCRNN(supports).to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=LR)
 
-    # 3. 创建Dataset和DataLoader
-    train_dataset = METRLADataset(os.path.join(DATA_ROOT, "train.npz"), scaler)
-    val_dataset = METRLADataset(os.path.join(DATA_ROOT, "val.npz"), scaler)
-    test_dataset = METRLADataset(os.path.join(DATA_ROOT, "test.npz"), scaler)
-
-    train_loader = DataLoader(train_dataset, BATCH_SIZE, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, BATCH_SIZE, shuffle=False, drop_last=True)
-    test_loader = DataLoader(test_dataset, BATCH_SIZE, shuffle=False, drop_last=True)
-
-    # 4. 模型初始化
-    model = DCRNN().to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.1)
-
-    # 5. 训练
-    print(f"Start training on {DEVICE}...")
-    best_mae = float('inf')
     train_losses, val_maes = [], []
+    best_mae = 1e9
 
-    for epoch in range(EPOCHS):
-        t0 = time.time()
-        train_loss = train_epoch(model, train_loader, adj, optimizer)
-        val_mae, val_rmse, val_mape = test_epoch(model, val_loader, adj)
+    log_print(f"===== DCRNN Training Started at {run_time} =====")
+    log_print(f"Save directory: {SAVE_DIR}")
 
-        train_losses.append(train_loss)
-        val_maes.append(val_mae)
+    for epoch in range(1, EPOCHS+1):
+        model.train()
+        total_loss = 0
+        pbar = tqdm(range(0, len(x_train), BATCH_SIZE), desc=f"Epoch {epoch}/{EPOCHS}")
 
-        # 保存最优模型
-        if val_mae < best_mae:
-            best_mae = val_mae
-            torch.save(model.state_dict(), 'DCRNN_METR-LA_best.pth')
+        for i in pbar:
+            x = x_train[i:i+BATCH_SIZE]
+            y = y_train[i:i+BATCH_SIZE]
+            pred = model(x, y, epoch)
+            loss = masked_mae(pred, y)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            total_loss += loss.item() * len(x)
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
-        scheduler.step(val_mae)
-        print(f"Epoch {epoch + 1:2d} | Time:{time.time() - t0:.1f}s | TrainLoss:{train_loss:.4f}")
-        print(f"Val MAE:{val_mae:.4f} RMSE:{val_rmse:.4f} MAPE:{val_mape:.4f}\n")
+        avg_loss = total_loss / len(x_train)
+        train_losses.append(avg_loss)
 
-    # 6. 最终测试
-    model.load_state_dict(torch.load('DCRNN_METR-LA_best.pth'))
-    test_mae, test_rmse, test_mape = test_epoch(model, test_loader, adj)
-    print("=" * 50)
-    print("Final Test Results (METR-LA)")
-    print(f"MAE:  {test_mae:.4f}")
-    print(f"RMSE: {test_rmse:.4f}")
-    print(f"MAPE: {test_mape:.4f}")
-    print("=" * 50)
+        # ========== 【流畅验证】关键优化 ==========
+        mae_v, rmse_v, mape_v = evaluate(model, x_val, y_val, BATCH_SIZE)
+        val_maes.append(mae_v)
 
-    # 7. 绘制损失曲线
-    plt.figure(figsize=(10, 4))
+        log_print(f"[Epoch {epoch:2d}] TrainLoss: {avg_loss:.4f} | Val MAE: {mae_v:.4f} RMSE: {rmse_v:.4f} MAPE: {mape_v:.4f}")
+
+        if mae_v < best_mae:
+            best_mae = mae_v
+            torch.save(model.state_dict(), os.path.join(SAVE_DIR, "best_model.pth"))
+
+    # 测试
+    mae_t, rmse_t, mape_t = evaluate(model, x_test, y_test, BATCH_SIZE)
+    log_print("\n===== FINAL TEST RESULT =====")
+    log_print(f"MAE:  {mae_t:.4f}")
+    log_print(f"RMSE: {rmse_t:.4f}")
+    log_print(f"MAPE: {mape_t:.4f}")
+
+    # 绘图
+    plt.figure(figsize=(12,5))
+    plt.subplot(121)
     plt.plot(train_losses, label='Train Loss')
-    plt.plot(val_maes, label='Val MAE')
-    plt.xlabel('Epoch'), plt.ylabel('Loss'), plt.title('DCRNN Training Curve')
-    plt.legend(), plt.grid(True)
-    plt.savefig('DCRNN_loss_curve.png', dpi=150)
+    plt.title('Train Loss')
+    plt.grid()
+    plt.legend()
+
+    plt.subplot(122)
+    plt.plot(val_maes, label='Val MAE', color='orange')
+    plt.title('Val MAE')
+    plt.grid()
+    plt.legend()
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(SAVE_DIR, "curves.png"), dpi=150)
     plt.show()
 
-
-if __name__ == "__main__":
-    main()
+    log_print(f"\nAll results saved to: {SAVE_DIR}")
