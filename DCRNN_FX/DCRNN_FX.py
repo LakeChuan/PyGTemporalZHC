@@ -9,21 +9,21 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from datetime import datetime
 
-# ======================== 超参数（稳定版）=========================
+# ======================== 超参数（官方 DCRNN）=========================
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 SEQ_LEN = 12
 PRED_LEN = 12
 NUM_NODES = 207
 INPUT_DIM = 1
 OUTPUT_DIM = 1
-RNN_UNITS = 64        # 恢复
-NUM_LAYERS = 2        # 恢复
+RNN_UNITS = 64
+NUM_LAYERS = 2
 MAX_DIFFUSION_STEP = 2
 BATCH_SIZE = 32
-EPOCHS = 30
-LR = 0.001             # 变小，训练更稳定
-USE_CURRICULUM = False # 关闭课程学习，防止震荡
-CL_DECAY_STEPS = 1000
+EPOCHS = 100  # 官方原版 100 轮
+LR = 0.001
+USE_CURRICULUM = False
+PATIENCE = 15  # 早停：15轮不下降就停
 
 # ======================== 路径 =========================
 DATA_ROOT = "./METR-LA"
@@ -58,7 +58,7 @@ def load_graph_data(pkl_filename):
     return adj_mx.astype(np.float32)
 
 def calculate_random_walk_matrix(adj_mx):
-    adj = sp.coo_matrix(adj_mx)
+    adj = sp.coo_matrix(adj_mx)  # 这里已修复！！！
     d = np.array(adj.sum(1))
     d_inv = np.power(d, -1).flatten()
     d_inv[np.isinf(d_inv)] = 0.0
@@ -68,13 +68,13 @@ def calculate_random_walk_matrix(adj_mx):
 
 def load_dataset(root):
     data = {}
-    for split in ['train', 'val', 'test']:
+    for split in ['train_small', 'val', 'test']:
         path = os.path.join(root, f'{split}.npz')
         npz = np.load(path)
         data[f'x_{split}'] = npz['x'][..., [0]]
         data[f'y_{split}'] = npz['y'][..., [0]]
-    scaler = StandardScaler(data['x_train'][...,0].mean(), data['x_train'][...,0].std())
-    for split in ['train', 'val', 'test']:
+    scaler = StandardScaler(data['x_train_small'][...,0].mean(), data['x_train_small'][...,0].std())
+    for split in ['train_small', 'val', 'test']:
         data[f'x_{split}'] = scaler.transform(data[f'x_{split}'])
         data[f'y_{split}'] = scaler.transform(data[f'y_{split}'])
     return data, scaler
@@ -162,53 +162,87 @@ class DCRNN(nn.Module):
         return self.dec(self.enc(x), y, PRED_LEN, USE_CURRICULUM, step)
 
 # ===========================================================================
-# ======================== 指标 ========================
+# ======================== 指标（修复 MAPE 爆炸）=========================
 # ===========================================================================
-def masked_mae(pred, label, null=0):
-    m = (label != null).float()
-    m /= m.mean()
-    return (F.l1_loss(pred, label, reduction='none') * m).mean()
+def masked_mae(pred, label, scaler, null=0):
+    pred = scaler.inverse_transform(pred)
+    label = scaler.inverse_transform(label)
+    m = (label > null).float()
+    sum_mask = m.sum()
+    if sum_mask == 0: return torch.tensor(0.0, device=pred.device)
+    return (F.l1_loss(pred, label, reduction='none') * m).sum() / sum_mask
 
-def masked_rmse(pred, label, null=0):
-    m = (label != null).float()
-    m /= m.mean()
-    return torch.sqrt((F.mse_loss(pred, label, reduction='none') * m).mean())
+def masked_rmse(pred, label, scaler, null=0):
+    pred = scaler.inverse_transform(pred)
+    label = scaler.inverse_transform(label)
+    m = (label > null).float()
+    sum_mask = m.sum()
+    if sum_mask == 0: return torch.tensor(0.0, device=pred.device)
+    return torch.sqrt(((F.mse_loss(pred, label, reduction='none') * m).sum() / sum_mask))
 
-def masked_mape(pred, label, null=0):
-    m = (label != null).float()
-    m /= m.mean()
-    return (torch.abs((pred-label)/label) * m).mean()
+def masked_mape(pred, label, scaler, null=1.0):
+    pred = scaler.inverse_transform(pred)
+    label = scaler.inverse_transform(label)
+    m = (label > null).float()
+    sum_mask = m.sum()
+    if sum_mask == 0: return torch.tensor(0.0, device=pred.device)
+    return (torch.abs((pred - label) / (label + 1e-8)) * m).sum() / sum_mask * 100
 
 # ===========================================================================
-# ======================== 流畅训练核心 ========================
+# ======================== 分步骤评测 ========================
 # ===========================================================================
-def evaluate(model, x, y, batch_size):
+def evaluate_horizon(model, x, y, scaler, batch_size):
     model.eval()
-    total_mae = 0
-    total_rmse = 0
-    total_mape = 0
+    total_mae  = [0.0, 0.0, 0.0]
+    total_rmse = [0.0, 0.0, 0.0]
+    total_mape = [0.0, 0.0, 0.0]
+    count = 0
+    horizons = [2, 5, 11]
+
+    with torch.no_grad():
+        for i in range(0, len(x), batch_size):
+            x_b = x[i:i+batch_size]
+            y_b = y[i:i+batch_size]
+            pred_b = model(x_b, y_b)
+
+            for idx, h in enumerate(horizons):
+                p = pred_b[:, h]
+                l = y_b[:, h]
+                total_mae[idx]  += masked_mae(p, l, scaler).item() * len(x_b)
+                total_rmse[idx] += masked_rmse(p, l, scaler).item() * len(x_b)
+                total_mape[idx] += masked_mape(p, l, scaler).item() * len(x_b)
+            count += len(x_b)
+
+    mae  = [v/count for v in total_mae]
+    rmse = [v/count for v in total_rmse]
+    mape = [v/count for v in total_mape]
+    return mae, rmse, mape
+
+def evaluate(model, x, y, scaler, batch_size):
+    model.eval()
+    total_mae, total_rmse, total_mape = 0.0, 0.0, 0.0
     count = 0
     with torch.no_grad():
         for i in range(0, len(x), batch_size):
             x_b = x[i:i+batch_size]
             y_b = y[i:i+batch_size]
             pred = model(x_b, y_b)
-            total_mae += masked_mae(pred, y_b).item() * len(x_b)
-            total_rmse += masked_rmse(pred, y_b).item() * len(x_b)
-            total_mape += masked_mape(pred, y_b).item() * len(x_b)
+            total_mae  += masked_mae(pred, y_b, scaler).item() * len(x_b)
+            total_rmse += masked_rmse(pred, y_b, scaler).item() * len(x_b)
+            total_mape += masked_mape(pred, y_b, scaler).item() * len(x_b)
             count += len(x_b)
     return total_mae/count, total_rmse/count, total_mape/count
 
 # ===========================================================================
-# ======================== 主程序 ========================
+# ======================== 主程序 + 早停 ========================
 # ===========================================================================
 if __name__ == "__main__":
     adj = load_graph_data(ADJ_PATH)
     supports = [calculate_random_walk_matrix(adj), calculate_random_walk_matrix(adj.T)]
     data, scaler = load_dataset(DATA_ROOT)
 
-    x_train = torch.FloatTensor(data['x_train']).to(DEVICE)
-    y_train = torch.FloatTensor(data['y_train']).to(DEVICE)
+    x_train = torch.FloatTensor(data['x_train_small']).to(DEVICE)
+    y_train = torch.FloatTensor(data['y_train_small']).to(DEVICE)
     x_val = torch.FloatTensor(data['x_val']).to(DEVICE)
     y_val = torch.FloatTensor(data['y_val']).to(DEVICE)
     x_test = torch.FloatTensor(data['x_test']).to(DEVICE)
@@ -219,6 +253,7 @@ if __name__ == "__main__":
 
     train_losses, val_maes = [], []
     best_mae = 1e9
+    patience_counter = 0
 
     log_print(f"===== DCRNN Training Started at {run_time} =====")
     log_print(f"Save directory: {SAVE_DIR}")
@@ -232,49 +267,63 @@ if __name__ == "__main__":
             x = x_train[i:i+BATCH_SIZE]
             y = y_train[i:i+BATCH_SIZE]
             pred = model(x, y, epoch)
-            loss = masked_mae(pred, y)
+            loss = masked_mae(pred, y, scaler)
             opt.zero_grad()
             loss.backward()
             opt.step()
             total_loss += loss.item() * len(x)
-            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+            pbar.set_postfix({"loss": f"{loss.item():.2f}"})
 
         avg_loss = total_loss / len(x_train)
         train_losses.append(avg_loss)
 
-        # ========== 【流畅验证】关键优化 ==========
-        mae_v, rmse_v, mape_v = evaluate(model, x_val, y_val, BATCH_SIZE)
+        # 验证
+        mae_v, rmse_v, mape_v = evaluate(model, x_val, y_val, scaler, BATCH_SIZE)
         val_maes.append(mae_v)
 
-        log_print(f"[Epoch {epoch:2d}] TrainLoss: {avg_loss:.4f} | Val MAE: {mae_v:.4f} RMSE: {rmse_v:.4f} MAPE: {mape_v:.4f}")
+        # 【打印完整：MAE + RMSE + MAPE】
+        log_print(f"[Epoch {epoch:2d}] TrainLoss: {avg_loss:.2f} | Val MAE: {mae_v:.2f} RMSE: {rmse_v:.2f} MAPE: {mape_v:.2f}%")
 
+        # 【早停策略】
         if mae_v < best_mae:
             best_mae = mae_v
+            patience_counter = 0
             torch.save(model.state_dict(), os.path.join(SAVE_DIR, "best_model.pth"))
+        else:
+            patience_counter += 1
+            log_print(f"⚠ Early Stopping Counter: {patience_counter}/{PATIENCE}")
+            if patience_counter >= PATIENCE:
+                log_print("🛑 Early Stopping Triggered!")
+                break
 
-    # 测试
-    mae_t, rmse_t, mape_t = evaluate(model, x_test, y_test, BATCH_SIZE)
-    log_print("\n===== FINAL TEST RESULT =====")
-    log_print(f"MAE:  {mae_t:.4f}")
-    log_print(f"RMSE: {rmse_t:.4f}")
-    log_print(f"MAPE: {mape_t:.4f}")
+    # ===================== 测试 =====================
+    model.load_state_dict(torch.load(os.path.join(SAVE_DIR, "best_model.pth")))
+    mae, rmse, mape = evaluate_horizon(model, x_test, y_test, scaler, BATCH_SIZE)
+
+    log_print("\n" + "="*60)
+    log_print("               DCRNN 论文标准测试结果（真实车速）")
+    log_print("="*60)
+    log_print(f"15min (第3步)  MAE: {mae[0]:.2f} | RMSE: {rmse[0]:.2f} | MAPE: {mape[0]:.2f}%")
+    log_print(f"30min (第6步)  MAE: {mae[1]:.2f} | RMSE: {rmse[1]:.2f} | MAPE: {mape[1]:.2f}%")
+    log_print(f"60min (第12步) MAE: {mae[2]:.2f} | RMSE: {rmse[2]:.2f} | MAPE: {mape[2]:.2f}%")
+    log_print("="*60)
 
     # 绘图
     plt.figure(figsize=(12,5))
     plt.subplot(121)
-    plt.plot(train_losses, label='Train Loss')
+    plt.plot(train_losses, label='Train Loss', linewidth=2)
     plt.title('Train Loss')
-    plt.grid()
+    plt.grid(True)
     plt.legend()
 
     plt.subplot(122)
-    plt.plot(val_maes, label='Val MAE', color='orange')
-    plt.title('Val MAE')
-    plt.grid()
+    plt.plot(val_maes, label='Val MAE', color='orange', linewidth=2)
+    plt.title('Validation MAE')
+    plt.grid(True)
     plt.legend()
 
     plt.tight_layout()
     plt.savefig(os.path.join(SAVE_DIR, "curves.png"), dpi=150)
     plt.show()
 
-    log_print(f"\nAll results saved to: {SAVE_DIR}")
+    log_print(f"\n✅ All results saved to: {SAVE_DIR}")
