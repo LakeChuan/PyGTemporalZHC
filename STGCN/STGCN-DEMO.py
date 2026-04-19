@@ -125,12 +125,14 @@ class GraphConvLayer(nn.Module):
 
         # 图卷积计算
         if self.conv_type == 'ChebGraphConv':
-            # 切比雪夫多项式展开（简化版，Ks=1）
-            x_list = [x_reshaped]
+            # 切比雪夫多项式展开（修复：Ks=1 也能正常运行）
+            x_list = [x_reshaped]  # 初始项永远存在
+            # 只有 Ks>1 才进入循环
             for k in range(1, self.Ks):
                 x_k = torch.matmul(self.gso, x_list[k-1])
                 x_list.append(x_k)
-            x_conv = sum([torch.matmul(x_k, self.weight[k]) for k in range(self.Ks)])
+            # 直接求和列表，不再依赖 x_k 变量
+            x_conv = sum(torch.matmul(x_k, self.weight[k]) for k, x_k in enumerate(x_list))
         else:
             # 普通图卷积：x' = GSO * x * weight
             x_conv = torch.matmul(torch.matmul(self.gso, x_reshaped), self.weight[0])
@@ -198,9 +200,9 @@ if __name__ == "__main__":
     Ks = 1               # 图卷积阶数
     channels = [2, 2, 2] # 通道数配置
     act_func = 'glu'     # 激活函数
-    graph_conv_type = 'GraphConv'  # 图卷积类型
+    graph_conv_type = 'ChebGraphConv'  # 图卷积类型
     bias = False         # 图卷积是否加偏置
-    droprate = 0.0       # Dropout概率（0=不丢弃）
+    droprate = 0.15       # Dropout概率（0=不丢弃）
 
     # -------------------- 2.2 构造测试数据 --------------------
     # 输入张量：[bs, c_in, ts, n_vertex]
