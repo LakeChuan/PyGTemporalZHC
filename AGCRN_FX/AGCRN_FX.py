@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import argparse
 import configparser
 from datetime import datetime
+import matplotlib.pyplot as plt
 
 # ===================== 1. 路径适配（和你的目录完全对应）=====================
 # 当前文件所在目录（AGCRN_FX）
@@ -25,7 +26,7 @@ DATASET = 'PEMSD4'  # PEMSD4 or PEMSD8
 DEVICE = 'cuda:0'
 MODEL = 'AGCRN'
 
-# 读取同目录下的conf文件
+# 读取同目录下conf文件
 config_file = os.path.join(BASE_DIR, f'{DATASET}_{MODEL}.conf')
 print(f'Reading config file: {config_file}')
 config = configparser.ConfigParser()
@@ -53,24 +54,22 @@ def print_model_parameters(model, only_num=True):
     print('*****************Finish Parameter****************')
 
 
-# 日志工具
+# 日志工具（已增强：自动保存 log.txt）
 def get_logger(root, name=None, debug=True):
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
     formatter = logging.Formatter('%(asctime)s: %(message)s', "%Y-%m-%d %H:%M")
     console_handler = logging.StreamHandler()
-    if debug:
-        console_handler.setLevel(logging.DEBUG)
-    else:
-        console_handler.setLevel(logging.INFO)
-        logfile = os.path.join(root, 'run.log')
-        print(f'Creating log file at: {logfile}')
-        file_handler = logging.FileHandler(logfile, mode='w')
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+    console_handler.setLevel(logging.DEBUG)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
+
+    # 自动保存 log.txt
+    log_path = os.path.join(root, "log.txt")
+    file_handler = logging.FileHandler(log_path, mode='w', encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
     return logger
 
 
@@ -230,7 +229,7 @@ def load_st_dataset(dataset):
         data_path = os.path.join(DATA_DIR, 'PEMS08', 'pems08.npz')
     else:
         raise ValueError
-    data = np.load(data_path)['data'][:, :, 0]  # 只取流量维度
+    data = np.load(data_path)['data'][:, :, 0]
     if len(data.shape) == 2:
         data = np.expand_dims(data, axis=-1)
     print(f'Load {dataset} Dataset shaped: {data.shape}')
@@ -394,7 +393,7 @@ class AGCRN(nn.Module):
         return output
 
 
-# ===================== 4. 训练器 =====================
+# ===================== 4. 训练器（只新增功能）=====================
 class Trainer(object):
     def __init__(self, model, loss, optimizer, train_loader, val_loader, test_loader, scaler, args, lr_scheduler=None):
         self.model = model
@@ -410,10 +409,13 @@ class Trainer(object):
         if val_loader is not None:
             self.val_per_epoch = len(val_loader)
         self.best_path = os.path.join(self.args.log_dir, 'best_model.pth')
-        if not args.debug:
-            os.makedirs(args.log_dir, exist_ok=True)
+        os.makedirs(args.log_dir, exist_ok=True)
         self.logger = get_logger(args.log_dir, name=args.model, debug=args.debug)
         self.logger.info(f'Experiment log path in: {args.log_dir}')
+
+        # ========== 新增：早停 + 绘图记录 ==========
+        self.train_loss_list = []
+        self.val_loss_list = []
 
     def val_epoch(self, epoch, val_dataloader):
         self.model.eval()
@@ -464,32 +466,51 @@ class Trainer(object):
         best_loss = float('inf')
         not_improved_count = 0
         start_time = time.time()
+
         for epoch in range(1, self.args.epochs + 1):
-            train_epoch_loss = self.train_epoch(epoch)
+            train_loss = self.train_epoch(epoch)
             val_dataloader = self.val_loader if self.val_loader is not None else self.test_loader
-            val_epoch_loss = self.val_epoch(epoch, val_dataloader)
-            if train_epoch_loss > 1e6:
+            val_loss = self.val_epoch(epoch, val_dataloader)
+
+            # ========== 新增：保存loss曲线 ==========
+            self.train_loss_list.append(train_loss)
+            self.val_loss_list.append(val_loss)
+
+            if train_loss > 1e6:
                 self.logger.warning('Gradient explosion detected. Ending...')
                 break
-            if val_epoch_loss < best_loss:
-                best_loss = val_epoch_loss
+
+            if val_loss < best_loss:
+                best_loss = val_loss
                 not_improved_count = 0
                 best_state = True
             else:
                 not_improved_count += 1
                 best_state = False
-            if self.args.early_stop and not_improved_count == self.args.early_stop_patience:
-                self.logger.info(
-                    f"Validation performance didn't improve for {self.args.early_stop_patience} epochs. Training stops.")
+
+            # ========== 新增：早停触发 ==========
+            if self.args.early_stop and not_improved_count >= self.args.early_stop_patience:
+                self.logger.info(f"Early stop triggered! Patience={self.args.early_stop_patience}")
                 break
+
             if best_state:
                 self.logger.info('*********************************Current best model saved!')
                 best_model = copy.deepcopy(self.model.state_dict())
+
+        # ========== 新增：绘制loss曲线并保存 ==========
+        plt.figure()
+        plt.plot(self.train_loss_list, label='Train Loss')
+        plt.plot(self.val_loss_list, label='Val Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.title('Loss Curve')
+        plt.savefig(os.path.join(self.args.log_dir, 'loss_curve.png'))
+        plt.close()
+
         training_time = time.time() - start_time
         self.logger.info(f"Total training time: {training_time / 60:.4f}min, best loss: {best_loss:.6f}")
-        if not self.args.debug:
-            torch.save(best_model, self.best_path)
-            self.logger.info(f"Saving current best model to {self.best_path}")
+        torch.save(best_model, self.best_path)
         self.model.load_state_dict(best_model)
         self.test(self.model, self.args, self.test_loader, self.scaler, self.logger)
 
@@ -517,10 +538,7 @@ class Trainer(object):
         else:
             y_pred = scaler.inverse_transform(torch.cat(y_pred, dim=0))
 
-        # ===================== ✅ 只加了下面这一行 =====================
         os.makedirs(args.log_dir, exist_ok=True)
-        # ===================== 以上是唯一修复 =====================
-
         np.save(os.path.join(args.log_dir, f'{args.dataset}_true.npy'), y_true.cpu().numpy())
         np.save(os.path.join(args.log_dir, f'{args.dataset}_pred.npy'), y_pred.cpu().numpy())
         for t in range(y_true.shape[1]):
@@ -542,7 +560,6 @@ def masked_mae_loss(scaler, mask_value):
             labels = scaler.inverse_transform(labels)
         mae = MAE_torch(pred=preds, true=labels, mask_value=mask_value)
         return mae
-
     return loss
 
 
@@ -641,21 +658,21 @@ def main():
                                                             milestones=lr_decay_steps,
                                                             gamma=args.lr_decay_rate)
 
-    # config log path
-    current_time = datetime.now().strftime('%Y%m%d%H%M%S')
-    args.log_dir = os.path.join(BASE_DIR, 'experiments', args.dataset, current_time)
+    # ========== 新增：数据集_时间戳 文件夹 ==========
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    exp_name = f"{args.dataset}_{timestamp}"
+    args.log_dir = os.path.join(BASE_DIR, "results", exp_name)
+    os.makedirs(args.log_dir, exist_ok=True)
 
     # start training
-    trainer = Trainer(model, loss, optimizer, train_loader, val_loader, test_loader, scaler, args,
-                      lr_scheduler=lr_scheduler)
-    if args.mode == 'train':
+    trainer = Trainer(model, loss, optimizer, train_loader, val_loader, test_loader, scaler, args, lr_scheduler=lr_scheduler)
+    if args.mode.lower() == 'train':
         trainer.train()
-    elif args.mode == 'test':
+    elif args.mode.lower() == 'test':
         model.load_state_dict(torch.load(os.path.join(BASE_DIR, 'pre-trained', f'{args.dataset}.pth')))
         print("Load saved model")
         trainer.test(model, trainer.args, test_loader, scaler, trainer.logger)
     else:
-        print(f"Warning: mode={args.mode} not recognized, using train mode by default")
         trainer.train()
 
 
